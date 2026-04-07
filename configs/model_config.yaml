@@ -1,0 +1,19 @@
+model:
+  layers: 6
+  hidden_size: 256
+  heads: 8
+  context_length: 1024
+  vocab_size: 500  # Will be updated by tokenizer
+
+training:
+  batch_size: 16
+  learning_rate: 0.0001
+  epochs: 50
+  save_interval: 5
+  genre: "pop"
+  track_type: "single"
+
+tokenizer:
+  type: "REMI"
+  quantize_tempo: 12
+  quantize_velocity: 8
