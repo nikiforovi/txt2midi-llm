@@ -59,6 +59,11 @@ def train_v2():
         max_seq_len=config['model']['context_length']
     ).to(device)
 
+    # Multi-GPU support
+    if torch.cuda.device_count() > 1:
+        print(f"--- DETECTED {torch.cuda.device_count()} GPUs! Enabling DataParallel ---")
+        music_model = nn.DataParallel(music_model)
+
     # 3. Setup Dataset (Sharded support)
     dataset = MIDIDatasetV2("data/datasets", tokenizer, max_len=config['model']['context_length'])
     if len(dataset) == 0:
@@ -112,6 +117,7 @@ def train_v2():
             loss.backward()
             
             # Gradient clipping to prevent spikes
+            # If multi-GPU, music_model might be DataParallel, but parameters() still works
             torch.nn.utils.clip_grad_norm_(music_model.parameters(), max_norm=1.0)
             
             optimizer.step()
@@ -131,9 +137,13 @@ def train_v2():
         # Save checkpoints
         if (epoch + 1) % config['training']['save_interval'] == 0:
             checkpoint_path = f"checkpoints/v2_epoch_{epoch+1}.pth"
+            
+            # Handle DataParallel state dict (remove 'module.' prefix)
+            model_to_save = music_model.module if hasattr(music_model, 'module') else music_model
+            
             torch.save({
                 'epoch': epoch + 1,
-                'music_model': music_model.state_dict(),
+                'music_model': model_to_save.state_dict(),
                 'prompt_encoder': prompt_encoder.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'config': config,
