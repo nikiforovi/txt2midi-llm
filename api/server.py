@@ -5,31 +5,40 @@ import os
 import yaml
 import uuid
 import sys
+from typing import Optional
 
 # Add project root to sys.path
 sys.path.append(os.getcwd())
 
-from inference.generate import MusicGenerator
+from inference.generate import MusicGeneratorV2
 
-app = FastAPI(title="txt2midi API")
+app = FastAPI(title="txt2midi v2 API")
 
 # Load config
 with open("configs/model_config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
-# Initialize generator
-# Note: In a real scenario, you'd point this to your best checkpoint
-CHECKPOINT_PATH = "checkpoints/baseline_epoch_50.pth"
-generator = MusicGenerator(CHECKPOINT_PATH, config)
+# Initialize generator v2
+CHECKPOINT_PATH = "checkpoints/v2_epoch_50.pth"
+# Fallback to general checkpoint if v2 doesn't exist yet
+if not os.path.exists(CHECKPOINT_PATH):
+    CHECKPOINT_PATH = "checkpoints/v2_epoch_5.pth" # Try any v2 checkpoint
+
+generator = MusicGeneratorV2(CHECKPOINT_PATH, config)
 
 class GenerateRequest(BaseModel):
     prompt: str
+    tempo: Optional[int] = 120
+    mode: Optional[str] = "major"
+    root: Optional[str] = "C"
+    strict_scale: Optional[bool] = False
+    chromaticity: Optional[float] = 0.0
     temperature: float = 1.0
     max_len: int = 512
 
 @app.post("/generate")
 async def generate_midi(request: GenerateRequest):
-    """Generates a MIDI file from a text prompt."""
+    """Generates a MIDI file with v2 parameters."""
     try:
         output_dir = "data/generated"
         os.makedirs(output_dir, exist_ok=True)
@@ -40,6 +49,11 @@ async def generate_midi(request: GenerateRequest):
         generator.generate_to_file(
             text_prompt=request.prompt,
             output_path=file_path,
+            tempo=request.tempo,
+            mode=request.mode,
+            root=request.root,
+            strict_scale=request.strict_scale,
+            chromaticity=request.chromaticity,
             max_len=request.max_len,
             temperature=request.temperature
         )
@@ -54,7 +68,7 @@ async def generate_midi(request: GenerateRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": "txt2midi-baseline"}
+    return {"status": "ok", "model": "txt2midi-v2"}
 
 if __name__ == "__main__":
     import uvicorn

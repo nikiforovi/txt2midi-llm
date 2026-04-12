@@ -4,15 +4,14 @@ from miditoolkit.midi.containers import Note, Instrument
 from typing import List, Dict, Any, Tuple
 
 class MIDITokenizer:
-    """REMI Tokenizer for MIDI files."""
+    """REMI+ Tokenizer for Multi-Instrument MIDI files."""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.beat_res = 4  # 4 slots per beat for baseline (16th notes)
-        self.ticks_per_beat = 480  # Default MIDI ticks per beat
+        self.beat_res = 4  # 4 slots per beat (16th notes)
+        self.ticks_per_beat = 480
         self.position_res = self.ticks_per_beat // self.beat_res
         
-        # Vocab definition
         self.vocab = []
         self._build_vocab()
         self.token_to_id = {t: i for i, t in enumerate(self.vocab)}
@@ -20,87 +19,107 @@ class MIDITokenizer:
         self.vocab_size = len(self.vocab)
 
     def _build_vocab(self):
-        """Builds the REMI vocabulary."""
+        """Builds expanded REMI+ vocabulary."""
         self.vocab.append("Pad_None")
         self.vocab.append("Bar_None")
         
-        # Position (0-15 for 4/4 bar with 16th note resolution)
+        # 1. Position (0-15)
         for i in range(16):
             self.vocab.append(f"Position_{i}")
             
-        # Note_On (Pitch 0-127)
+        # 2. Instrument (General MIDI 0-127)
+        for i in range(128):
+            self.vocab.append(f"Instrument_{i}")
+            
+        # 3. Note_On (Pitch 0-127)
         for i in range(128):
             self.vocab.append(f"Note_Pitch_{i}")
             
-        # Note_Duration (0-32 16th notes)
+        # 4. Note_Duration (0-32 16th notes)
         for i in range(1, 33):
             self.vocab.append(f"Note_Duration_{i}")
             
-        # Note_Velocity (0-127 quantized to 8 levels)
+        # 5. Note_Velocity (0-127 quantized to 8 levels)
         for i in range(0, 128, 16):
             self.vocab.append(f"Note_Velocity_{i}")
 
-    def encode(self, midi_path: str, instrument_idx: int = 0) -> List[int]:
-        """Encodes a MIDI file into a sequence of token IDs.
-        
-        Args:
-            midi_path: Path to MIDI file.
-            instrument_idx: Index of the instrument to encode (0 for baseline, 
-                             2 for POP909 Piano Accompaniment).
-        """
+    def encode(self, midi_path: str) -> List[int]:
+        """Encodes multi-track MIDI into a interleaved REMI+ stream."""
         midi_obj = miditoolkit.midi.parser.MidiFile(midi_path)
         ticks_per_beat = midi_obj.ticks_per_beat
         pos_res = ticks_per_beat // self.beat_res
         
-        if instrument_idx >= len(midi_obj.instruments):
-            instrument_idx = 0
-            
-        notes = midi_obj.instruments[instrument_idx].notes
-        notes.sort(key=lambda x: x.start)
+        all_notes = []
+        for inst in midi_obj.instruments:
+            if inst.is_drum: continue # Drums handled separately or ignored for now
+            for note in inst.notes:
+                all_notes.append({
+                    "pitch": note.pitch,
+                    "start": note.start,
+                    "end": note.end,
+                    "velocity": note.velocity,
+                    "program": inst.program
+                })
+        
+        # Sort by start time, then pitch
+        all_notes.sort(key=lambda x: (x["start"], x["pitch"]))
         
         tokens = []
         last_bar = -1
+        last_pos = -1
+        last_program = -1
         
-        for note in notes:
-            # Calculate bar and position
-            bar = note.start // (ticks_per_beat * 4)
-            pos = (note.start % (ticks_per_beat * 4)) // pos_res
+        for note in all_notes:
+            bar = note["start"] // (ticks_per_beat * 4)
+            pos = (note["start"] % (ticks_per_beat * 4)) // pos_res
             
-            # Add Bar token if needed
+            # 1. Time Context
             if bar > last_bar:
                 for _ in range(bar - last_bar):
                     tokens.append("Bar_None")
                 last_bar = bar
-                
-            # Add Position token
-            tokens.append(f"Position_{int(pos)}")
+                last_pos = -1 # Reset pos on new bar
             
-            # Add Note information
-            tokens.append(f"Note_Pitch_{note.pitch}")
+            if pos > last_pos:
+                tokens.append(f"Position_{int(pos)}")
+                last_pos = pos
             
-            # Duration (quantized to 16th notes)
-            dur = max(1, round((note.end - note.start) / pos_res))
+            # 2. Instrument Context
+            if note["program"] != last_program:
+                tokens.append(f"Instrument_{note['program']}")
+                last_program = note["program"]
+            
+            # 3. Note Data
+            tokens.append(f"Note_Pitch_{note['pitch']}")
+            
+            dur = max(1, round((note["end"] - note["start"]) / pos_res))
             dur = min(dur, 32)
             tokens.append(f"Note_Duration_{dur}")
             
-            # Velocity (quantized)
-            vel = (note.velocity // 16) * 16
+            vel = (note["velocity"] // 16) * 16
             tokens.append(f"Note_Velocity_{vel}")
             
         return [self.token_to_id[t] for t in tokens if t in self.token_to_id]
 
-    def decode(self, token_ids: List[int], output_path: str):
-        """Decodes a sequence of token IDs into a MIDI file."""
+    def decode(self, token_ids: List[int], output_path: str, target_bpm: float = None):
+        """Decodes REMI+ tokens back to multi-track MIDI."""
         tokens = [self.id_to_token[tid] for tid in token_ids]
         
         midi_obj = miditoolkit.midi.parser.MidiFile()
         midi_obj.ticks_per_beat = self.ticks_per_beat
         pos_res = self.ticks_per_beat // self.beat_res
         
-        instrument = Instrument(program=0, is_drum=False, name="Piano")
+        # If target_bpm is requested, we adjust ticks accordingly
+        # But usually we just set the tempo meta-message
+        if target_bpm:
+            # We add a tempo change at tick 0
+            midi_obj.tempo_changes.append(miditoolkit.TempoChange(target_bpm, 0))
+
+        instruments = {} # Store instrument objects by program
         
         current_bar = -1
         current_pos = 0
+        current_program = 0 # Default Piano
         
         i = 0
         while i < len(tokens):
@@ -111,26 +130,28 @@ class MIDITokenizer:
             elif t.startswith("Position_"):
                 current_pos = int(t.split("_")[1])
                 i += 1
-                # Expect Pitch, Duration, Velocity follows
-                if i + 2 < len(tokens) and tokens[i].startswith("Note_Pitch_"):
-                    pitch = int(tokens[i].split("_")[2])
-                    dur = int(tokens[i+1].split("_")[2])
-                    vel = int(tokens[i+2].split("_")[2])
-                    
-                    start_tick = current_bar * (self.ticks_per_beat * 4) + current_pos * pos_res
-                    end_tick = start_tick + dur * pos_res
-                    
-                    instrument.notes.append(Note(
-                        pitch=pitch,
-                        velocity=vel,
-                        start=start_tick,
-                        end=end_tick
-                    ))
-                    i += 3
-                else:
-                    i += 1
+            elif t.startswith("Instrument_"):
+                current_program = int(t.split("_")[1])
+                i += 1
+            elif t.startswith("Note_Pitch_"):
+                pitch = int(t.split("_")[2])
+                dur = int(tokens[i+1].split("_")[2])
+                vel = int(tokens[i+2].split("_")[2])
+                
+                if current_program not in instruments:
+                    instruments[current_program] = Instrument(program=current_program, is_drum=False)
+                
+                start_tick = current_bar * (self.ticks_per_beat * 4) + current_pos * pos_res
+                end_tick = start_tick + dur * pos_res
+                
+                instruments[current_program].notes.append(Note(
+                    pitch=pitch, velocity=vel, start=start_tick, end=end_tick
+                ))
+                i += 3
             else:
                 i += 1
                 
-        midi_obj.instruments.append(instrument)
+        for inst in instruments.values():
+            midi_obj.instruments.append(inst)
+            
         midi_obj.dump(output_path)
