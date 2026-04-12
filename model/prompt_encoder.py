@@ -8,16 +8,12 @@ class PromptEncoderV2(nn.Module):
     
     def __init__(self, model_name: str = "prajjwal1/bert-tiny", embedding_dim: int = 256):
         super().__init__()
-        print(f"DEBUG: Starting PromptEncoderV2.__init__ with {model_name}")
-        
         # 1. Text (Frozen BERT)
-        print("DEBUG: Loading Tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
-        print("DEBUG: Loading BERT Model...")
         self.bert = AutoModel.from_pretrained(model_name)
         
-        print("DEBUG: Freezing BERT parameters...")
+        # Force BERT to CPU immediately
+        self.bert.cpu()
         for param in self.bert.parameters():
             param.requires_grad = False
             
@@ -43,26 +39,24 @@ class PromptEncoderV2(nn.Module):
             nn.ReLU(),
             nn.Linear(embedding_dim * 2, embedding_dim)
         )
-        print("DEBUG: PromptEncoderV2.__init__ complete.")
-
-    def to(self, *args, **kwargs):
-        """Override .to() to keep BERT on CPU while everything else moves to GPU."""
-        super().to(*args, **kwargs)
-        self.bert.cpu() # Force BERT to stay on CPU
-        print("DEBUG: PromptEncoderV2 moved to device, BERT forced to CPU.")
-        return self
 
     def forward(self, prompts: List[str], modes: List[str], tempos: torch.Tensor, chromaticities: torch.Tensor):
         device = tempos.device
         
-        # 1. Text embedding (Forced to CPU)
+        # 1. Text embedding (Strictly on CPU to avoid CUDA conflicts)
+        # Ensure BERT remains on CPU even if .to(device) was called on the parent module
+        if next(self.bert.parameters()).is_cuda:
+            self.bert.cpu()
+            
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        inputs = {k: v.cpu() for k, v in inputs.items()}
+        # Force inputs to CPU
+        inputs = {k: v.to('cpu') for k, v in inputs.items()}
         
         with torch.no_grad():
-            text_out = self.bert(**inputs).last_hidden_state[:, 0, :]
+            outputs = self.bert(**inputs)
+            text_out = outputs.last_hidden_state[:, 0, :]
             
-        # Move text output to the same device as the rest of the model (GPU)
+        # Move result to GPU (master device)
         text_out = text_out.to(device)
         
         # 2. Mode embedding
