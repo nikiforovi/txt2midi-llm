@@ -8,15 +8,20 @@ class PromptEncoderV2(nn.Module):
     
     def __init__(self, model_name: str = "prajjwal1/bert-tiny", embedding_dim: int = 256):
         super().__init__()
+        print(f"DEBUG: Starting PromptEncoderV2.__init__ with {model_name}")
+        
         # 1. Text (Frozen BERT)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        print("DEBUG: Loading Tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        print("DEBUG: Loading BERT Model...")
         self.bert = AutoModel.from_pretrained(model_name)
-        # Force BERT to CPU for stability (tiny model, fast on CPU)
-        self.bert.cpu()
+        
+        print("DEBUG: Freezing BERT parameters...")
         for param in self.bert.parameters():
             param.requires_grad = False
             
-        bert_out_dim = self.bert.config.hidden_size
+        self.bert_out_dim = self.bert.config.hidden_size
         
         # 2. Mode (Categorical)
         self.mode_list = [
@@ -26,7 +31,6 @@ class PromptEncoderV2(nn.Module):
         self.mode_embedding = nn.Embedding(len(self.mode_list) + 1, 64)
         
         # 3. Numerical (Scalar projection)
-        # Inputs: [Tempo, Chromaticity]
         self.numerical_projection = nn.Sequential(
             nn.Linear(2, 64),
             nn.ReLU(),
@@ -34,26 +38,25 @@ class PromptEncoderV2(nn.Module):
         )
         
         # 4. Fusion Layer
-        # bert + mode + numerical -> model_dim
         self.fusion = nn.Sequential(
-            nn.Linear(bert_out_dim + 64 + 64, embedding_dim * 2),
+            nn.Linear(self.bert_out_dim + 64 + 64, embedding_dim * 2),
             nn.ReLU(),
             nn.Linear(embedding_dim * 2, embedding_dim)
         )
+        print("DEBUG: PromptEncoderV2.__init__ complete.")
+
+    def to(self, *args, **kwargs):
+        """Override .to() to keep BERT on CPU while everything else moves to GPU."""
+        super().to(*args, **kwargs)
+        self.bert.cpu() # Force BERT to stay on CPU
+        print("DEBUG: PromptEncoderV2 moved to device, BERT forced to CPU.")
+        return self
 
     def forward(self, prompts: List[str], modes: List[str], tempos: torch.Tensor, chromaticities: torch.Tensor):
-        """
-        Args:
-            prompts: List of text descriptions
-            modes: List of mode names
-            tempos: tensor of (batch_size, 1) - normalized 0-1 (e.g. bpm/300)
-            chromaticities: tensor of (batch_size, 1) - 0-1
-        """
         device = tempos.device
         
-        # Text embedding (Forced to CPU)
+        # 1. Text embedding (Forced to CPU)
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        # Move inputs to CPU specifically for BERT
         inputs = {k: v.cpu() for k, v in inputs.items()}
         
         with torch.no_grad():
@@ -62,20 +65,22 @@ class PromptEncoderV2(nn.Module):
         # Move text output to the same device as the rest of the model (GPU)
         text_out = text_out.to(device)
         
-        # Mode embedding
+        # 2. Mode embedding
         mode_ids = []
         for m in modes:
             if m in self.mode_list:
                 mode_ids.append(self.mode_list.index(m))
             else:
-                mode_ids.append(len(self.mode_list)) # Unknown
-        mode_emb = self.mode_embedding(torch.tensor(mode_ids, device=device))
+                mode_ids.append(len(self.mode_list))
+                
+        mode_ids_tensor = torch.tensor(mode_ids, device=device)
+        mode_emb = self.mode_embedding(mode_ids_tensor)
         
-        # Numerical embedding
+        # 3. Numerical embedding
         num_input = torch.cat([tempos, chromaticities], dim=-1)
         num_emb = self.numerical_projection(num_input)
         
-        # Concatenate and Fuse
+        # 4. Concatenate and Fuse
         combined = torch.cat([text_out, mode_emb, num_emb], dim=-1)
         global_context = self.fusion(combined)
         
