@@ -7,6 +7,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import GradScaler, autocast
 
 # Add project root to sys.path
 sys.path.append(os.getcwd())
@@ -22,7 +23,7 @@ def plot_loss(losses: list, output_path: str):
     plt.plot(losses, label='Training Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('txt2midi v2 Training Progress')
+    plt.title('txt2midi v2 Turbo Training Progress')
     plt.legend()
     plt.grid(True)
     plt.savefig(output_path)
@@ -38,15 +39,23 @@ def train_v2():
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
+    # Detect Kaggle environment for checkpointing
+    is_kaggle = os.path.exists('/kaggle/working')
+    output_dir = '/kaggle/working/outputs_v2' if is_kaggle else 'outputs_v2'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Path for the loss curve - keep it in root for Kaggle to be easily visible
+    plot_path = '/kaggle/working/loss_curve.png' if is_kaggle else os.path.join(output_dir, "loss_curve.png")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"--- txt2midi v2 Training Launch ---")
-    print(f"Device: {device}")
-    print(f"Parameters: Hidden={config['model']['hidden_size']}, Layers={config['model']['layers']}")
+    print(f"--- txt2midi v2 TURBO Training Launch ---")
+    print(f"Device: {device} | Total GPUs: {torch.cuda.device_count()}")
+    print(f"AMP: Enabled | Multi-threading: 4 workers")
 
     # 2. Initialize Tokenizer & Models
     tokenizer = MIDITokenizer(config)
     
-    print("Initializing PromptEncoderV2 (loading BERT weights)...")
+    print("Initializing PromptEncoderV2 (CPU BERT)...")
     prompt_encoder = PromptEncoderV2(embedding_dim=config['model']['hidden_size']).to(device)
     
     print("Building MusicTransformer architecture...")
@@ -61,34 +70,37 @@ def train_v2():
 
     # Multi-GPU support
     if torch.cuda.device_count() > 1:
-        print(f"--- DETECTED {torch.cuda.device_count()} GPUs! Enabling DataParallel ---")
+        print(f"--- Enabling DataParallel for {torch.cuda.device_count()} GPUs ---")
         music_model = nn.DataParallel(music_model)
 
-    # 3. Setup Dataset (Sharded support)
+    # 3. Setup Dataset
     dataset = MIDIDatasetV2("data/datasets", tokenizer, max_len=config['model']['context_length'])
     if len(dataset) == 0:
-        print("Dataset is empty. Ensure data/datasets/v2_master contains shard_*.jsonl files.")
+        print("Dataset is empty. Ensure shards are present.")
         return
 
-    dataloader = DataLoader(dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=0)
+    # Turbo loading: 4 workers + pin_memory
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=config['training']['batch_size'], 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True
+    )
 
-    # 4. Optimizer and Scheduler
-    # We optimize EVERYTHING (Transformer + PromptEncoder conditioning layers)
+    # 4. Optimizer and Speed-ups
     optimizer = torch.optim.AdamW(
         list(music_model.parameters()) + list(prompt_encoder.parameters()),
         lr=config['training']['learning_rate']
     )
     
-    # Cosine Annealing: high LR at start, gradually decreasing to 1/10th or less
     scheduler = CosineAnnealingLR(optimizer, T_max=config['training']['epochs'], eta_min=1e-5)
-    
-    criterion = nn.CrossEntropyLoss(ignore_index=0) # 0 is Pad_None
+    scaler = GradScaler() # For Mixed Precision
+    criterion = nn.CrossEntropyLoss(ignore_index=0) 
 
     # 5. Training Loop
     epochs = config['training']['epochs']
     epoch_losses = []
-    
-    os.makedirs("checkpoints", exist_ok=True)
     
     for epoch in range(epochs):
         music_model.train()
@@ -97,32 +109,37 @@ def train_v2():
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         for batch in progress_bar:
-            tokens = batch["tokens"].to(device)
+            tokens = batch["tokens"].to(device, non_blocking=True)
             prompts = batch["prompt"]
             modes = batch["mode"]
-            tempos = batch["tempo"].to(device)
-            chromaticities = batch["chromaticity"].to(device)
+            tempos = batch["tempo"].to(device, non_blocking=True)
+            chromaticities = batch["chromaticity"].to(device, non_blocking=True)
             
             optimizer.zero_grad()
             
-            # Multi-factor Conditioning
-            global_context = prompt_encoder(prompts, modes, tempos, chromaticities)
+            # Use Mixed Precision (AMP)
+            with autocast():
+                # Conditioning
+                global_context = prompt_encoder(prompts, modes, tempos, chromaticities)
+                
+                # Forward pass
+                logits = music_model(tokens[:, :-1], global_context)
+                
+                # Loss calculation
+                loss = criterion(logits.reshape(-1, tokenizer.vocab_size), tokens[:, 1:].reshape(-1))
             
-            # Forward pass
-            logits = music_model(tokens[:, :-1], global_context)
+            # Scaled backward pass
+            scaler.scale(loss).backward()
             
-            # Loss: Target is tokens shifted by 1
-            loss = criterion(logits.reshape(-1, tokenizer.vocab_size), tokens[:, 1:].reshape(-1))
-            
-            loss.backward()
-            
-            # Gradient clipping to prevent spikes
-            # If multi-GPU, music_model might be DataParallel, but parameters() still works
+            # Gradient clipping (unscale before clipping)
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(music_model.parameters(), max_norm=1.0)
             
-            optimizer.step()
-            total_loss += loss.item()
+            # Scaled step
+            scaler.step(optimizer)
+            scaler.update()
             
+            total_loss += loss.item()
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
             
         avg_loss = total_loss / len(dataloader)
@@ -132,13 +149,12 @@ def train_v2():
         print(f"Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
         
         # Update plot
-        plot_loss(epoch_losses, "checkpoints/loss_curve.png")
+        plot_loss(epoch_losses, plot_path)
         
         # Save checkpoints
         if (epoch + 1) % config['training']['save_interval'] == 0:
-            checkpoint_path = f"checkpoints/v2_epoch_{epoch+1}.pth"
+            checkpoint_path = os.path.join(output_dir, f"v2_turbo_epoch_{epoch+1}.pth")
             
-            # Handle DataParallel state dict (remove 'module.' prefix)
             model_to_save = music_model.module if hasattr(music_model, 'module') else music_model
             
             torch.save({
@@ -151,7 +167,7 @@ def train_v2():
             }, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
 
-    print("\n✅ Training Complete!")
+    print("\n✅ TURBO Training Complete!")
 
 if __name__ == "__main__":
     train_v2()
