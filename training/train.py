@@ -46,7 +46,10 @@ def train_v2():
     # 2. Initialize Tokenizer & Models
     tokenizer = MIDITokenizer(config)
     
+    print("Initializing PromptEncoderV2 (loading BERT weights)...")
     prompt_encoder = PromptEncoderV2(embedding_dim=config['model']['hidden_size']).to(device)
+    
+    print("Building MusicTransformer architecture...")
     music_model = MusicTransformer(
         vocab_size=tokenizer.vocab_size,
         d_model=config['model']['hidden_size'],
@@ -62,7 +65,7 @@ def train_v2():
         print("Dataset is empty. Ensure data/datasets/v2_master contains shard_*.jsonl files.")
         return
 
-    dataloader = DataLoader(dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=2)
+    dataloader = DataLoader(dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=0)
 
     # 4. Optimizer and Scheduler
     # We optimize EVERYTHING (Transformer + PromptEncoder conditioning layers)

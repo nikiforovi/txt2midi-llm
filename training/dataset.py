@@ -21,17 +21,17 @@ class MIDIDatasetV2(Dataset):
         # 1. Check for sharded directory
         shard_dir = os.path.join(self.data_dir, "v2_master")
         if os.path.isdir(shard_dir):
-            print(f"Loading sharded dataset from {shard_dir}...")
             shard_files = sorted(glob.glob(os.path.join(shard_dir, "*.jsonl")))
             if not shard_files:
                 print(f"Warning: No .jsonl files found in {shard_dir}")
             else:
-                for sf in shard_files:
+                print(f"Found {len(shard_files)} shards. Loading...")
+                for sf in tqdm.tqdm(shard_files, desc="Loading shards"):
                     with open(sf, "r", encoding="utf-8") as f:
                         for line in f:
                             if line.strip():
                                 self.samples.append(json.loads(line))
-                print(f"Successfully loaded {len(self.samples)} samples from {len(shard_files)} shards.")
+                print(f"Successfully loaded {len(self.samples)} samples.")
                 return
 
         # 2. Fallback to single file
