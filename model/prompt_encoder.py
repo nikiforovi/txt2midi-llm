@@ -11,6 +11,8 @@ class PromptEncoderV2(nn.Module):
         # 1. Text (Frozen BERT)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
         self.bert = AutoModel.from_pretrained(model_name)
+        # Force BERT to CPU for stability (tiny model, fast on CPU)
+        self.bert.cpu()
         for param in self.bert.parameters():
             param.requires_grad = False
             
@@ -49,9 +51,16 @@ class PromptEncoderV2(nn.Module):
         """
         device = tempos.device
         
-        # Text embedding
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
-        text_out = self.bert(**inputs).last_hidden_state[:, 0, :]
+        # Text embedding (Forced to CPU)
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        # Move inputs to CPU specifically for BERT
+        inputs = {k: v.cpu() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            text_out = self.bert(**inputs).last_hidden_state[:, 0, :]
+            
+        # Move text output to the same device as the rest of the model (GPU)
+        text_out = text_out.to(device)
         
         # Mode embedding
         mode_ids = []
