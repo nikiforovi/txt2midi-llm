@@ -95,7 +95,7 @@ def train_v2():
     )
     
     scheduler = CosineAnnealingLR(optimizer, T_max=config['training']['epochs'], eta_min=1e-5)
-    scaler = GradScaler() # For Mixed Precision
+    scaler = torch.amp.GradScaler('cuda') # For Mixed Precision
     criterion = nn.CrossEntropyLoss(ignore_index=0) 
 
     # 5. Training Loop
@@ -118,7 +118,7 @@ def train_v2():
             optimizer.zero_grad()
             
             # Use Mixed Precision (AMP)
-            with autocast():
+            with torch.amp.autocast('cuda'):
                 # Conditioning
                 global_context = prompt_encoder(prompts, modes, tempos, chromaticities)
                 

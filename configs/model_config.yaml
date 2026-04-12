@@ -7,7 +7,7 @@ model:
   vocab_size: 512
 
 training:
-  batch_size: 128
+  batch_size: 64
   learning_rate: 0.0002
   epochs: 30
   save_interval: 5
