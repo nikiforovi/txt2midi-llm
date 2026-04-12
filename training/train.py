@@ -2,9 +2,11 @@ import torch
 import os
 import sys
 import yaml
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Add project root to sys.path
 sys.path.append(os.getcwd())
@@ -14,19 +16,35 @@ from model.prompt_encoder import PromptEncoderV2
 from tokenizer.midi_tokenizer import MIDITokenizer
 from training.dataset import MIDIDatasetV2
 
+def plot_loss(losses: list, output_path: str):
+    """Simple matplotlib plotter for training monitoring."""
+    plt.figure(figsize=(10, 5))
+    plt.plot(losses, label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('txt2midi v2 Training Progress')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(output_path)
+    plt.close()
+
 def train_v2():
     # 1. Load Config
-    with open("configs/model_config.yaml", "r") as f:
+    config_path = "configs/model_config.yaml"
+    if not os.path.exists(config_path):
+        print(f"Error: Config {config_path} not found.")
+        return
+        
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"v2 Training on {device}")
+    print(f"--- txt2midi v2 Training Launch ---")
+    print(f"Device: {device}")
+    print(f"Parameters: Hidden={config['model']['hidden_size']}, Layers={config['model']['layers']}")
 
-    # 2. Initialize Tokenizer & Model
+    # 2. Initialize Tokenizer & Models
     tokenizer = MIDITokenizer(config)
-    
-    # Update vocab_size in config from tokenizer
-    config['model']['vocab_size'] = tokenizer.vocab_size
     
     prompt_encoder = PromptEncoderV2(embedding_dim=config['model']['hidden_size']).to(device)
     music_model = MusicTransformer(
@@ -38,31 +56,39 @@ def train_v2():
         max_seq_len=config['model']['context_length']
     ).to(device)
 
-    # 3. Setup Dataset
+    # 3. Setup Dataset (Sharded support)
     dataset = MIDIDatasetV2("data/datasets", tokenizer, max_len=config['model']['context_length'])
     if len(dataset) == 0:
-        print("Empty dataset. Please run scripts/build_dataset.py first.")
+        print("Dataset is empty. Ensure data/datasets/v2_master contains shard_*.jsonl files.")
         return
 
-    dataloader = DataLoader(dataset, batch_size=config['training']['batch_size'], shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=2)
 
-    # 4. Optimizer and Loss
-    # We optimize MusicTransformer AND the learnable parts of PromptEncoderV2 (mode embeddings, MLP, fusion)
-    optimizer = torch.optim.Adam(
-        list(music_model.parameters()) + list(prompt_encoder.mode_embedding.parameters()) + 
-        list(prompt_encoder.numerical_projection.parameters()) + list(prompt_encoder.fusion.parameters()),
+    # 4. Optimizer and Scheduler
+    # We optimize EVERYTHING (Transformer + PromptEncoder conditioning layers)
+    optimizer = torch.optim.AdamW(
+        list(music_model.parameters()) + list(prompt_encoder.parameters()),
         lr=config['training']['learning_rate']
     )
+    
+    # Cosine Annealing: high LR at start, gradually decreasing to 1/10th or less
+    scheduler = CosineAnnealingLR(optimizer, T_max=config['training']['epochs'], eta_min=1e-5)
+    
     criterion = nn.CrossEntropyLoss(ignore_index=0) # 0 is Pad_None
 
     # 5. Training Loop
     epochs = config['training']['epochs']
+    epoch_losses = []
+    
+    os.makedirs("checkpoints", exist_ok=True)
+    
     for epoch in range(epochs):
         music_model.train()
         prompt_encoder.train()
         total_loss = 0
         
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        for batch in progress_bar:
             tokens = batch["tokens"].to(device)
             prompts = batch["prompt"]
             modes = batch["mode"]
@@ -74,29 +100,45 @@ def train_v2():
             # Multi-factor Conditioning
             global_context = prompt_encoder(prompts, modes, tempos, chromaticities)
             
-            # Forward pass: Causal language modeling
-            # logits: (batch, seq_len-1, vocab_size)
+            # Forward pass
             logits = music_model(tokens[:, :-1], global_context)
             
-            # Loss calculation
+            # Loss: Target is tokens shifted by 1
             loss = criterion(logits.reshape(-1, tokenizer.vocab_size), tokens[:, 1:].reshape(-1))
             
             loss.backward()
-            optimizer.step()
             
+            # Gradient clipping to prevent spikes
+            torch.nn.utils.clip_grad_norm_(music_model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
             total_loss += loss.item()
             
-        print(f"Epoch {epoch+1} Loss: {total_loss / len(dataloader):.4f}")
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+            
+        avg_loss = total_loss / len(dataloader)
+        epoch_losses.append(avg_loss)
+        scheduler.step()
+        
+        print(f"Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # Update plot
+        plot_loss(epoch_losses, "checkpoints/loss_curve.png")
         
         # Save checkpoints
         if (epoch + 1) % config['training']['save_interval'] == 0:
-            os.makedirs("checkpoints", exist_ok=True)
+            checkpoint_path = f"checkpoints/v2_epoch_{epoch+1}.pth"
             torch.save({
+                'epoch': epoch + 1,
                 'music_model': music_model.state_dict(),
                 'prompt_encoder': prompt_encoder.state_dict(),
+                'optimizer': optimizer.state_dict(),
                 'config': config,
-                'vocab_size': tokenizer.vocab_size
-            }, f"checkpoints/v2_epoch_{epoch+1}.pth")
+                'losses': epoch_losses
+            }, checkpoint_path)
+            print(f"Saved checkpoint: {checkpoint_path}")
+
+    print("\n✅ Training Complete!")
 
 if __name__ == "__main__":
     train_v2()
