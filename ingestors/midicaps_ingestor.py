@@ -1,72 +1,61 @@
 import os
-from datasets import load_dataset
+import json
 from ingestors.base_ingestor import BaseIngestor
 from typing import List, Dict, Any
 import tqdm
 
 class MidiCapsIngestor(BaseIngestor):
-    """Ingestor for the MidiCaps dataset from Hugging Face."""
+    """Ingestor for the MidiCaps dataset using local files with parallel processing."""
     
-    def __init__(self, output_dir: str = "data/raw_midi/midicaps"):
-        super().__init__(output_dir)
-        self.dataset_name = "amaai-lab/midicaps"
+    def __init__(self, base_dir: str = "data/raw_midi/midicaps"):
+        super().__init__(base_dir)
+        self.base_dir = base_dir
+        self.metadata_path = os.path.join(base_dir, "train.json")
 
-    def ingest(self, limit: int = None) -> List[Dict[str, Any]]:
-        """Downloads midicaps and processes files."""
-        print(f"Loading {self.dataset_name} from Hugging Face...")
-        
-        # Load metadata
-        ds = load_dataset(self.dataset_name, split='train', streaming=True)
-        
-        processed_data = []
+    def ingest(self, limit: int = None, num_workers: int = None) -> List[Dict[str, Any]]:
+        """Collects tasks from JSONL and processes them in parallel."""
+        if not os.path.exists(self.metadata_path):
+            print(f"Error: Metadata file {self.metadata_path} not found.")
+            return []
+            
+        tasks = []
         count = 0
         
-        # In a real environment, we'd need to download the actual .mid files.
-        # MidiCaps dataset usually points to filenames that exist in Lakh or are provided in the repo.
-        # For this implementation, we assume the user has the files or we mock the download path.
+        print(f"Scanning metadata and collecting tasks from {self.metadata_path}...")
         
-        for item in ds:
-            if limit and count >= limit:
-                break
+        with open(self.metadata_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if limit and count >= limit:
+                    break
                 
-            # item contains: 'location', 'caption', 'tempo', 'genre', etc.
-            midi_filename = item['location']
-            caption = item['caption']
-            
-            # Placeholder: In a real run, we would locate the file on disk
-            # For MidiCaps, the files are often in a 'zip' or separate repo.
-            # We'll use a search path logic.
-            midi_path = self._find_midi_file(midi_filename)
-            
-            if midi_path and os.path.exists(midi_path):
-                entry = self.standardize_entry(midi_path, {
-                    "source": "midicaps",
-                    "original_caption": caption,
-                    "genre": item.get("genre", "unknown"),
-                    "mood": item.get("mood", "unknown")
-                })
-                
-                if entry:
-                    # Enrich prompt with Midicaps caption
-                    entry["prompt"] = f"{caption} (Tempo: {entry['tempo']}, Scale: {entry['scale']})"
-                    processed_data.append(entry)
-                    count += 1
-                    if count % 100 == 0:
-                        print(f"Processed {count} MidiCaps files...")
-            
-        return processed_data
-
-    def _find_midi_file(self, filename: str) -> str:
-        """Heuristic to find the MIDI file locally."""
-        # Check in output_dir and common subfolders
-        search_paths = [
-            self.output_dir,
-            os.path.join(self.output_dir, "midis"),
-            "data/raw_midi/lmd_full" # Often MidiCaps points to Lakh filenames
-        ]
+                try:
+                    item = json.loads(line)
+                    midi_rel_path = item['location']
+                    caption = item['caption']
+                    
+                    midi_path = os.path.join(self.base_dir, midi_rel_path)
+                    
+                    if os.path.exists(midi_path):
+                        # Prepare metadata to be passed to worker
+                        raw_meta = {
+                            "source": "midicaps",
+                            "original_caption": caption,
+                            "genre": item.get("genre", []),
+                            "mood": item.get("mood", "unknown")
+                        }
+                        tasks.append((midi_path, raw_meta))
+                        count += 1
+                except:
+                    continue
         
-        for p in search_paths:
-            full_path = os.path.join(p, filename)
-            if os.path.exists(full_path):
-                return full_path
-        return None
+        print(f"Collected {len(tasks)} valid tasks. Starting parallel processing...")
+        
+        # Run parallel processing via BaseIngestor method
+        entries = self.run_parallel(tasks, num_workers=num_workers)
+        
+        # Post-process prompts (can be done parallel too, but it's cheap strings)
+        for entry in entries:
+            # Enrich entry with technical context if needed
+             entry["prompt"] = entry["metadata"]["original_caption"]
+             
+        return entries

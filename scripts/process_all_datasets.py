@@ -6,11 +6,10 @@ import sys
 sys.path.append(os.getcwd())
 
 from ingestors.midicaps_ingestor import MidiCapsIngestor
-# from ingestors.lmd_ingestor import LakhIngestor # To be implemented
 
-def process_all_datasets(output_master_path: str, limit_per_source: int = 1000):
-    """Orchestrates multiple ingestors and performs global deduplication."""
-    os.makedirs(os.path.dirname(output_master_path), exist_ok=True)
+def process_all_datasets(output_dir: str, limit_per_source: int = 1000, num_workers: int = None, shard_size: int = 1000):
+    """Orchestrates multiple ingestors and saves results in sharded JSONL files."""
+    os.makedirs(output_dir, exist_ok=True)
     
     ingestors = [
         MidiCapsIngestor()
@@ -20,8 +19,8 @@ def process_all_datasets(output_master_path: str, limit_per_source: int = 1000):
     master_dataset = []
     
     for ingestor in ingestors:
-        print(f"--- Running Ingestor: {ingestor.__class__.__name__} ---")
-        entries = ingestor.ingest(limit=limit_per_source)
+        print(f"--- Running Ingestor (Parallel): {ingestor.__class__.__name__} ---")
+        entries = ingestor.ingest(limit=limit_per_source, num_workers=num_workers)
         
         raw_count = len(entries)
         duplicates = 0
@@ -36,15 +35,27 @@ def process_all_datasets(output_master_path: str, limit_per_source: int = 1000):
                 
         print(f"Ingested {raw_count} samples. Unique: {raw_count - duplicates}. Duplicates: {duplicates}")
 
-    # Write master dataset
-    with open(output_master_path, "w") as f:
-        for entry in master_dataset:
-            f.write(json.dumps(entry) + "\n")
+    # Write master dataset in shards
+    print(f"Saving {len(master_dataset)} unique samples to shards in {output_dir}...")
+    
+    shard_count = 1
+    for i in range(0, len(master_dataset), shard_size):
+        shard_data = master_dataset[i:i + shard_size]
+        shard_name = f"shard_{shard_count:04d}.jsonl"
+        shard_path = os.path.join(output_dir, shard_name)
+        
+        with open(shard_path, "w", encoding="utf-8") as f:
+            for entry in shard_data:
+                f.write(json.dumps(entry) + "\n")
+        
+        shard_count += 1
             
-    print(f"\n✅ All datasets processed! Master dataset saved to {output_master_path}")
-    print(f"Total unique samples: {len(master_dataset)}")
+    print(f"\n✅ All datasets processed! Shards saved to {output_dir}")
 
 if __name__ == "__main__":
-    # For a start, let's ingest a small batch to verify everything works
-    MASTER_PATH = "data/datasets/v2_master_dataset.jsonl"
-    process_all_datasets(MASTER_PATH, limit_per_source=5000)
+    # Now pointing to a directory instead of a file
+    MASTER_DIR = "data/datasets/v2_master"
+    LIMIT = 50000 
+    WORKERS = os.cpu_count() 
+    
+    process_all_datasets(MASTER_DIR, limit_per_source=LIMIT, num_workers=WORKERS, shard_size=1000)
