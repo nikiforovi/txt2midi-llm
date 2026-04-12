@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 import os
 import json
 import glob
+import tqdm
 from typing import List, Dict, Any
 from tokenizer.midi_tokenizer import MIDITokenizer
 
