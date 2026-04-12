@@ -54,4 +54,4 @@ curl -X POST "http://localhost:8000/generate" \
 - `configs/`: YAML configurations.
 
 ## License
-MIT
+GNU GPL v3.0
