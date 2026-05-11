@@ -134,6 +134,10 @@ class MIDITokenizer:
                 current_program = int(t.split("_")[1])
                 i += 1
             elif t.startswith("Note_Pitch_"):
+                # Safety check: do we have enough tokens for a full note?
+                if i + 2 >= len(tokens):
+                    break
+                
                 pitch = int(t.split("_")[2])
                 dur = int(tokens[i+1].split("_")[2])
                 vel = int(tokens[i+2].split("_")[2])
