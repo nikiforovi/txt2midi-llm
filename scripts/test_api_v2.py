@@ -5,16 +5,16 @@ import time
 def test_generation():
     url = "http://localhost:8000/generate"
     payload = {
-        "prompt": "fast thrash metal riff in D minor",
-        "tempo": 180,
-        "mode": "minor",
-        "root": "D",
-        "strict_scale": True,
+        "prompt": "simple pop song with acoustic guitar in A major",
+        "tempo": 120,
+        "mode": "major",
+        "root": "A",
+        "strict_scale": False,
         "chromaticity": 0.0,
         "temperature": 0.5,
-        "top_p": 0.7,
-        "repetition_penalty": 1.1,
-        "max_len": 1024
+        "top_p": 0.8,
+        "no_repeat_ngram_size": 8,
+        "max_len": 512
     }
     
     print(f"--- API v2 Integration Test ---")

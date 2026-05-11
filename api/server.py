@@ -46,7 +46,7 @@ class GenerateRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 0.9
     top_k: int = 50
-    repetition_penalty: float = 1.1
+    no_repeat_ngram_size: int = 6
     max_len: int = 512
 
 @app.post("/generate")
@@ -74,7 +74,7 @@ async def generate_midi(request: GenerateRequest):
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
-            repetition_penalty=request.repetition_penalty
+            no_repeat_ngram_size=request.no_repeat_ngram_size
         )
         
         return FileResponse(

@@ -84,9 +84,17 @@ class MusicGeneratorV2:
         temperature: float = 1.0,
         top_p: float = 0.9,
         top_k: int = 50,
-        repetition_penalty: float = 1.1
+        no_repeat_ngram_size: int = 6
     ) -> List[int]:
-        """v2 Generation with advanced sampling (Top-P, Top-K, Repetition Penalty)."""
+        """v2 Generation with advanced sampling (Top-P, Top-K, N-gram blocking).
+        
+        Args:
+            no_repeat_ngram_size: Size of n-gram sequences to block from repeating.
+                A value of 6 means that any sequence of 6 tokens that already
+                appeared in the output will not be allowed to repeat.
+                Set to 0 to disable. Higher values allow more structural repetition
+                (e.g. recurring motifs), lower values force more variety.
+        """
         
         # Prepare conditioning inputs
         tempo_tensor = torch.tensor([[float(tempo) / 300.0]], device=self.device)
@@ -103,25 +111,25 @@ class MusicGeneratorV2:
             # Get latest logits
             next_token_logits = logits[0, -1, :]
             
-            # 1. Apply Frequency-based Repetition Penalty
-            if repetition_penalty != 1.0:
-                # Track frequencies in the last 64 tokens
-                window = generated[-64:]
-                from collections import Counter
-                counts = Counter(window)
+            # 1. N-gram blocking: prevent repeating sequences
+            if no_repeat_ngram_size > 0 and len(generated) >= no_repeat_ngram_size - 1:
+                # The current "suffix" we're trying to extend
+                ngram_prefix = generated[-(no_repeat_ngram_size - 1):]
                 
-                for token, count in counts.items():
-                    # Targeted Penalty: Only penalize pitch repetitions
-                    token_name = self.tokenizer.id_to_token.get(token, "")
-                    if "Note_Pitch" not in token_name:
-                        continue # Don't penalize rhythm, duration, velocity, or instruments
-                        
-                    # Scale penalty by frequency: penalty ^ count
-                    effective_penalty = repetition_penalty ** count
-                    if next_token_logits[token] > 0:
-                        next_token_logits[token] /= effective_penalty
-                    else:
-                        next_token_logits[token] *= effective_penalty
+                # Scan history for all previous occurrences of this prefix
+                banned_tokens = set()
+                for i in range(len(generated) - (no_repeat_ngram_size - 1)):
+                    # Check if the slice starting at i matches our prefix
+                    candidate = generated[i : i + no_repeat_ngram_size - 1]
+                    if candidate == ngram_prefix:
+                        # The token that followed this prefix last time is banned
+                        next_idx = i + no_repeat_ngram_size - 1
+                        if next_idx < len(generated):
+                            banned_tokens.add(generated[next_idx])
+                
+                # Apply ban
+                for token_id in banned_tokens:
+                    next_token_logits[token_id] = -float('Inf')
             
             # 2. Temperature scaling
             next_token_logits = next_token_logits / max(temperature, 1e-5)
@@ -154,6 +162,7 @@ class MusicGeneratorV2:
                 break
                 
         return generated
+
 
     def generate_to_file(
         self, 
@@ -201,6 +210,8 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=str, default="C", help="Root note (C, D, etc.)")
     parser.add_argument("--len", type=int, default=512, help="Max tokens to generate")
     parser.add_argument("--temp", type=float, default=1.0, help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p (nucleus) filtering threshold")
+    parser.add_argument("--ngram", type=int, default=6, help="N-gram size for blocking repeating patterns (0 to disable)")
     parser.add_argument("--strict", action="store_true", help="Snap notes to the chosen scale")
     
     args = parser.parse_args()
@@ -223,7 +234,10 @@ if __name__ == "__main__":
         root=args.root,
         max_len=args.len,
         temperature=args.temp,
+        top_p=args.top_p,
+        no_repeat_ngram_size=args.ngram,
         strict_scale=args.strict
     )
     
     print(f"✅ Success! MIDI saved to: {args.output}")
+

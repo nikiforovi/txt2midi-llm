@@ -138,9 +138,18 @@ class MIDITokenizer:
                 if i + 2 >= len(tokens):
                     break
                 
+                # Validate that the next two tokens are actually Duration and Velocity
+                dur_token = tokens[i+1]
+                vel_token = tokens[i+2]
+                
+                if not dur_token.startswith("Note_Duration_") or not vel_token.startswith("Note_Velocity_"):
+                    # Malformed note triple — skip this pitch token
+                    i += 1
+                    continue
+                
                 pitch = int(t.split("_")[2])
-                dur = int(tokens[i+1].split("_")[2])
-                vel = int(tokens[i+2].split("_")[2])
+                dur = int(dur_token.split("_")[2])
+                vel = int(vel_token.split("_")[2])
                 
                 if current_program not in instruments:
                     instruments[current_program] = Instrument(program=current_program, is_drum=False)
